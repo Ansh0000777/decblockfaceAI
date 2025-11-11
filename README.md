@@ -16,81 +16,67 @@ A blockchain-based voting platform with face authentication, built with React, S
 
 ### Prerequisites
 
-1. **Node.js** (v16 or higher)
-2. **MetaMask** browser extension
-3. **Ganache** for local blockchain development
+Install or verify the following before you begin:
 
-### Installation
+1. **Node.js** v18 or newer (includes `npm`). Download from [nodejs.org](https://nodejs.org/).
+2. **Git** for cloning this repository.
+3. **MetaMask** browser extension (Chrome, Firefox, Brave, etc.).
+4. **Local Ethereum network** – the bundled Hardhat node (`npm run node`) is sufficient; Ganache is optional.
+5. _(Optional)_ **VS Code** with Solidity/TypeScript extensions for a smoother developer experience.
 
-1. **Clone and install dependencies:**
+### Installation & Environment Setup
+
+1. **Clone and install dependencies**
    ```bash
+   git clone https://github.com/your-org/blockdface.git
    cd blockdface
    npm install
    ```
 
-2. **Download face recognition models:**
+2. **Create your environment file**
+   ```bash
+   cp .env.example .env  # if the template exists; otherwise create .env manually
+   ```
+   Minimum variables required:
+   ```dotenv
+   REACT_APP_RPC_URL=http://127.0.0.1:8545
+   ADMIN_OWNER_PRIVATE_KEY=0xYOUR_LOCAL_PRIVATE_KEY
+   ```
+   Use the private key of the account that will deploy the contract (for local chains, this is typically the first Hardhat/Ganache account). **Never commit this key.**
+
+3. **Download face recognition models (one-time)**
    ```bash
    npm run setup:models
    ```
 
-3. **Start local blockchain:**
+4. **Start the local blockchain (keep this terminal running)**
    ```bash
    npm run node
    ```
-   (Keep this running in a separate terminal)
+   This launches a Hardhat JSON-RPC node on `http://127.0.0.1:8545` with pre-funded accounts.
 
-4. **Compile and deploy smart contract:**
+5. **Deploy the smart contract using the Node script**
    ```bash
-   npm run compile
-   npm run deploy
+   npm run deploy:node
+   # equivalent to
+   node scripts/deploy-node.cjs
    ```
+   The script compiles `contracts/VotingSystem.sol`, deploys it with the private key from `.env`, and automatically updates:
+   - `public/contractInfo.json`
+   - `.env → REACT_APP_CONTRACT_ADDRESS`
 
-5. **Configure MetaMask:**
-   - Add Localhost 8545 network
-   - Import first Ganache account (100 ETH)
-   - Set network to "Localhost 8545"
+   Need to set an admin immediately? Append `-- --set-admin 0xADMIN_ADDRESS` to the command.
 
-6. **Start the application:**
+6. **Configure MetaMask**
+   - Add a network pointing to `http://127.0.0.1:8545` (chain ID `1337`).
+   - Import one of the pre-funded private keys printed by `npm run node`.
+   - Switch MetaMask to this network before interacting with the DApp.
+
+7. **Start the React application**
    ```bash
    npm start
    ```
-
-### Usage
-
-#### Admin Setup
-1. Visit `http://localhost:3000/admin`
-2. Connect MetaMask with admin account
-3. Add candidates using the dashboard
-4. Set voting period (start/end times)
-5. Monitor results in real-time
-
-#### Voter Registration & Voting
-1. Visit `http://localhost:3000`
-2. Click "Register Face" for new voters
-3. Allow camera access and follow prompts
-4. Login with face for returning voters
-5. Connect MetaMask wallet
-6. Select candidate and cast vote
-7. View results after voting period ends
-
-### Development
-
-```bash
-# Start development server
-npm start
-
-# Compile smart contracts
-npm run compile
-
-# Deploy to local blockchain
-npm run deploy
-
-# Run local blockchain
-npm run node
-
-# Setup face models
-npm run setup:models
-```
+   Visit [http://localhost:3000](http://localhost:3000). Restart the dev server after redeploying contracts so the new address is picked up.
 
 ### Security Features
 
@@ -99,7 +85,3 @@ npm run setup:models
 - Smart contract-based access control
 - MetaMask transaction confirmations
 - Time-locked voting periods
-
-### License
-
-MIT License
