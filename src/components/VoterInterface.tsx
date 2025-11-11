@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ContractService from '../services/ContractService';
 import { ROUTES, MESSAGES } from '../utils/constants';
@@ -30,8 +30,93 @@ const VoterInterface: React.FC = () => {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [winner, setWinner] = useState<string>('');
+  const [tieNames, setTieNames] = useState<string[]>([]);
   const [timeRemaining, setTimeRemaining] = useState('');
   const [chainNow, setChainNow] = useState<number>(0);
+  const [lastVotedRound, setLastVotedRound] = useState<number>(0);
+
+  const loadData = useCallback(async (addressOverride?: string) => {
+    try {
+      const voterAddress = addressOverride ?? account;
+      const [candidatesData, votingPeriodData] = await Promise.all([
+        ContractService.getCandidates(),
+        ContractService.getVotingPeriod(),
+      ]);
+
+      setCandidates(
+        candidatesData.ids.map((id: number, index: number) => ({
+          id,
+          name: candidatesData.names[index],
+        }))
+      );
+
+      // Compute active using system time to avoid idle-chain skew
+      const nowSys = Math.floor(Date.now() / 1000);
+      const activeNow =
+        votingPeriodData.startTime > 0 &&
+        nowSys >= votingPeriodData.startTime &&
+        nowSys < votingPeriodData.endTime;
+      setVotingPeriod({ ...votingPeriodData, isActive: activeNow });
+
+      let currentRound = 0;
+      try {
+        currentRound = await ContractService.getCurrentElectionRound();
+      } catch (roundErr) {
+        console.warn('Failed to fetch current election round:', roundErr);
+      }
+
+      if (voterAddress) {
+        try {
+          const [legacyHasVoted, lastRound] = await Promise.all([
+            ContractService.hasVoted(voterAddress),
+            ContractService.getLastVotedRound(voterAddress),
+          ]);
+          const lastRoundNum = Number(lastRound) || 0;
+          setLastVotedRound(lastRoundNum);
+          const votedThisRound = legacyHasVoted && lastRoundNum === currentRound;
+          setHasVoted(votedThisRound);
+        } catch (voteErr) {
+          console.warn('Unable to determine voter status:', voteErr);
+          setHasVoted(false);
+          setLastVotedRound(0);
+        }
+      } else {
+        setHasVoted(false);
+        setLastVotedRound(0);
+      }
+
+      // Check if voting has ended using chain time
+      try {
+        const now = await ContractService.getCurrentBlockTimestamp();
+        if (votingPeriodData.endTime > 0 && now >= votingPeriodData.endTime) {
+          try {
+            const multi = await ContractService.getWinners();
+            if (multi && multi.names && multi.names.length > 1) {
+              setWinner('');
+              setTieNames(multi.names);
+            } else if (multi && multi.names && multi.names.length === 1) {
+              setWinner(multi.names[0]);
+              setTieNames([]);
+            } else {
+              const singleWinner = await ContractService.getWinner();
+              setWinner(singleWinner);
+              setTieNames([]);
+            }
+          } catch (inner) {
+            console.error('Failed to retrieve winners:', inner);
+          }
+        } else {
+          setWinner('');
+          setTieNames([]);
+        }
+      } catch (timeErr) {
+        console.error('Failed to verify voting end time:', timeErr);
+      }
+    } catch (error) {
+      console.error('Failed to load voting data:', error);
+      setError('Failed to load voting data');
+    }
+  }, [account]);
 
   useEffect(() => {
     initializeVoterInterface();
@@ -46,6 +131,14 @@ const VoterInterface: React.FC = () => {
       return () => clearInterval(timer);
     }
   }, [votingPeriod]);
+
+  useEffect(() => {
+    if (votingPeriod.startTime > 0) {
+      setHasVoted(false);
+      setWinner('');
+      setTieNames([]);
+    }
+  }, [votingPeriod.startTime]);
 
   useEffect(() => {
     const eth: any = (window as any).ethereum;
@@ -124,38 +217,6 @@ const VoterInterface: React.FC = () => {
     }
   };
 
-  const loadData = async () => {
-    try {
-      const candidatesData = await ContractService.getCandidates();
-      const candidatesList: Candidate[] = candidatesData.ids.map((id: number, index: number) => ({
-        id,
-        name: candidatesData.names[index]
-      }));
-      setCandidates(candidatesList);
-
-      const votingPeriodData = await ContractService.getVotingPeriod();
-      // Compute active using system time to avoid idle-chain skew
-      const nowSys = Math.floor(Date.now() / 1000);
-      const activeNow =
-        votingPeriodData.startTime > 0 &&
-        nowSys >= votingPeriodData.startTime &&
-        nowSys < votingPeriodData.endTime;
-      setVotingPeriod({ ...votingPeriodData, isActive: activeNow });
-
-      // Check if voting has ended using chain time
-      try {
-        const now = await ContractService.getCurrentBlockTimestamp();
-        if (votingPeriodData.endTime > 0 && now >= votingPeriodData.endTime) {
-          const winnerData = await ContractService.getWinner();
-          setWinner(winnerData);
-        }
-      } catch {/* ignore */}
-    } catch (error) {
-      console.error('Failed to load data:', error);
-      setError('Failed to load voting data');
-    }
-  };
-
   const updateTimeRemaining = async () => {
     if (!votingPeriod.endTime) return;
 
@@ -202,6 +263,14 @@ const VoterInterface: React.FC = () => {
     try {
       const winnerData = await ContractService.getWinner();
       setWinner(winnerData);
+      try {
+        const multi = await ContractService.getWinners();
+        if (multi && multi.names && multi.names.length > 1) {
+          setTieNames(multi.names);
+        } else {
+          setTieNames([]);
+        }
+      } catch { /* ignore */ }
     } catch (error) {
       console.error('Failed to load winner:', error);
     }
@@ -296,8 +365,6 @@ const VoterInterface: React.FC = () => {
     );
   }
 
-  const showResults = !votingPeriod.isActive && votingPeriod.endTime > 0 && chainNow > 0 && chainNow >= votingPeriod.endTime;
-
   return (
     <div style={styles.container}>
       <div style={styles.votingBox}>
@@ -373,90 +440,84 @@ const VoterInterface: React.FC = () => {
           )}
         </div>
 
-        {/* Results Display (after voting ends) */}
-        {showResults && winner && (
+        {/* Tie banner for users (no full results) */}
+        {!votingPeriod.isActive && votingPeriod.endTime > 0 && chainNow > 0 && chainNow >= votingPeriod.endTime && tieNames.length > 1 && (
           <div style={styles.resultsCard}>
-            <h2>🎉 Election Results</h2>
-            <div style={styles.winnerAnnouncement}>
-              <h3>Winner: {winner}</h3>
-              <div style={styles.confetti}>🎊 🎉 🎊 🎉 🎊</div>
-            </div>
+            <h3 style={{ margin: 0 }}>Tied: {tieNames.join(', ')}</h3>
           </div>
         )}
 
         {/* Voting Interface */}
-        {!showResults && (
-          <div style={styles.votingCard}>
-            <h2>Cast Your Vote</h2>
+        <div style={styles.votingCard}>
+          <h2>Cast Your Vote</h2>
 
-            {hasVoted ? (
-              <div style={styles.alreadyVoted}>
-                <h3>✅ Vote Recorded</h3>
-                <p>You have successfully cast your vote. Thank you for participating!</p>
-                {votingPeriod.isActive && (
-                  <p>Results will be announced after the voting period ends.</p>
-                )}
-              </div>
-            ) : (
-              <>
-                {votingPeriod.startTime > 0 && !votingPeriod.isActive && (
-                  <div style={styles.notActive}>
-                    {chainNow > 0 && chainNow < votingPeriod.startTime ? (
-                      <p>Voting has not started yet. You can see candidates below.</p>
-                    ) : (
-                      <p>Voting has ended. You can still view candidates below.</p>
-                    )}
-                  </div>
-                )}
+          {hasVoted ? (
+            <div style={styles.alreadyVoted}>
+              <h3>✅ Vote Recorded</h3>
+              <p>You have successfully cast your vote. Thank you for participating!</p>
+              {votingPeriod.isActive && (
+                <p>Results will be announced after the voting period ends.</p>
+              )}
+            </div>
+          ) : (
+            <>
+              {votingPeriod.startTime > 0 && !votingPeriod.isActive && (
+                <div style={styles.notActive}>
+                  {chainNow > 0 && chainNow < votingPeriod.startTime ? (
+                    <p>Voting has not started yet. You can see candidates below.</p>
+                  ) : (
+                    <p>Voting has ended. You can still view candidates below.</p>
+                  )}
+                </div>
+              )}
 
-                {candidates.length === 0 ? (
-                  <p style={styles.noCandidates}>
-                    No candidates available for this election.
-                  </p>
-                ) : (
-                  <>
-                    <div style={styles.candidatesList}>
-                      {candidates.map((candidate) => (
-                        <div
-                          key={candidate.id}
-                          style={{
-                            ...styles.candidateOption,
-                            ...(selectedCandidate === candidate.id ? styles.selectedCandidate : {})
-                          }}
-                          onClick={() => setSelectedCandidate(candidate.id)}
-                        >
-                          <div style={styles.candidateInfo}>
-                            <div style={styles.radioButton}>
-                              {selectedCandidate === candidate.id && (
-                                <div style={styles.radioButtonSelected}></div>
-                              )}
-                            </div>
-                            <span style={styles.candidateName}>{candidate.name}</span>
+              {candidates.length === 0 ? (
+                <p style={styles.noCandidates}>
+                  No candidates available for this election.
+                </p>
+              ) : (
+                <>
+                  <div style={styles.candidatesList}>
+                    {candidates.map((candidate) => (
+                      <div
+                        key={candidate.id}
+                        style={{
+                          ...styles.candidateOption,
+                          ...(selectedCandidate === candidate.id ? styles.selectedCandidate : {})
+                        }}
+                        onClick={() => setSelectedCandidate(candidate.id)}
+                      >
+                        <div style={styles.candidateInfo}>
+                          <div style={styles.radioButton}>
+                            {selectedCandidate === candidate.id && (
+                              <div style={styles.radioButtonSelected}></div>
+                            )}
                           </div>
+                          <span style={styles.candidateName}>{candidate.name}</span>
                         </div>
-                      ))}
-                    </div>
+                      </div>
+                    ))}
+                  </div>
 
-                    <button
-                      onClick={handleVote}
-                      style={{
-                        ...styles.voteButton,
-                        ...((selectedCandidate === null || voting || !votingPeriod.isActive) ? styles.voteButtonDisabled : {})
-                      }}
-                      disabled={selectedCandidate === null || voting || !votingPeriod.isActive}
-                    >
-                      {voting ? 'Casting Vote...' : (votingPeriod.isActive ? 'Cast Vote' : 'Vote when Active')}
-                    </button>
+                  <button
+                    onClick={handleVote}
+                    style={{
+                      ...styles.voteButton,
+                      ...((selectedCandidate === null || voting || !votingPeriod.isActive) ? styles.voteButtonDisabled : {})
+                    }}
+                    disabled={selectedCandidate === null || voting || !votingPeriod.isActive}
+                  >
+                    {voting ? 'Casting Vote...' : (votingPeriod.isActive ? 'Cast Vote' : 'Vote when Active')}
+                  </button>
 
-                    <p style={styles.disclaimer}>
-                      ⚠️ Your vote can be cast only during the active period and each wallet can vote once.
-                    </p>
-                  </>
-                )}
-              </>
-            )}
-          </div>
-        )}
+                  <p style={styles.disclaimer}>
+                    ⚠️ Your vote can be cast only during the active period and each wallet can vote once.
+                  </p>
+                </>
+              )}
+            </>
+          )}
+        </div>
 
         {/* Contract Info */}
         <div style={styles.infoCard}>

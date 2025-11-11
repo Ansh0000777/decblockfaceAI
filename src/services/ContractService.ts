@@ -124,9 +124,65 @@ export const CONTRACT_ABI = [
   },
   {
     inputs: [],
+    name: 'electionRound',
+    outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [{ internalType: 'address', name: '', type: 'address' }],
+    name: 'lastVotedRound',
+    outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [],
     name: 'getWinner',
     outputs: [{ internalType: 'string', name: 'winnerName', type: 'string' }],
     stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [],
+    name: 'getWinners',
+    outputs: [
+      { internalType: 'uint256[]', name: 'ids', type: 'uint256[]' },
+      { internalType: 'string[]', name: 'names', type: 'string[]' },
+    ],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [
+      { internalType: 'uint256[]', name: 'idsForRunoff', type: 'uint256[]' },
+      { internalType: 'uint256', name: '_startTime', type: 'uint256' },
+      { internalType: 'uint256', name: '_endTime', type: 'uint256' },
+    ],
+    name: 'startRunoff',
+    outputs: [],
+    stateMutability: 'nonpayable',
+    type: 'function',
+  },
+  {
+    inputs: [],
+    name: 'getWinners',
+    outputs: [
+      { internalType: 'uint256[]', name: 'ids', type: 'uint256[]' },
+      { internalType: 'string[]', name: 'names', type: 'string[]' },
+    ],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [
+      { internalType: 'uint256[]', name: 'idsForRunoff', type: 'uint256[]' },
+      { internalType: 'uint256', name: '_startTime', type: 'uint256' },
+      { internalType: 'uint256', name: '_endTime', type: 'uint256' },
+    ],
+    name: 'startRunoff',
+    outputs: [],
+    stateMutability: 'nonpayable',
     type: 'function',
   },
   {
@@ -175,6 +231,7 @@ interface VotingContract extends ethers.BaseContract {
   removeCandidate(id: number | bigint): Promise<ethers.TransactionResponse>;
   setVotingPeriod(start: number | bigint, end: number | bigint): Promise<ethers.TransactionResponse>;
   clearVotingPeriod(): Promise<ethers.TransactionResponse>;
+  startRunoff(idsForRunoff: Array<number | bigint>, start: number | bigint, end: number | bigint): Promise<ethers.TransactionResponse>;
   vote(id: number | bigint): Promise<ethers.TransactionResponse>;
   // read
   owner(): Promise<string>;
@@ -182,7 +239,11 @@ interface VotingContract extends ethers.BaseContract {
   getCandidates(): Promise<[bigint[], string[]]>;
   getResults(): Promise<[bigint[], string[], bigint[]]>;
   getWinner(): Promise<string>;
+  getWinners(): Promise<[bigint[], string[]]>;
   getVotingPeriod(): Promise<[bigint, bigint, boolean]>;
+  electionRound(): Promise<bigint>;
+  lastVotedRound(addr: string): Promise<bigint>;
+  startRunoff(idsForRunoff: Array<number | bigint>, start: number | bigint, end: number | bigint): Promise<ethers.TransactionResponse>;
 }
 
 // ---------- Service ----------
@@ -813,6 +874,18 @@ class ContractService {
     }
   }
 
+  async getWinners(): Promise<{ ids: number[]; names: string[] }> {
+    try {
+      if (!this.contract) return { ids: [], names: [] };
+      const anyC: any = this.contract as any;
+      if (!anyC.getWinners) return { ids: [], names: [] };
+      const [idsBig, names] = await anyC.getWinners();
+      return { ids: (idsBig || []).map((b: any) => Number(b)), names: names || [] };
+    } catch {
+      return { ids: [], names: [] };
+    }
+  }
+
   async getResults(): Promise<{ ids: number[]; names: string[]; votes: number[] }> {
     try {
       if (!this.contract) return { ids: [], names: [], votes: [] };
@@ -827,36 +900,98 @@ class ContractService {
   async getWinner(): Promise<string> {
     try {
       if (!this.contract) return 'No candidates';
+      // Prefer multi-winner path first for accurate ties
+      try {
+        const multi = await this.getWinners();
+        if (multi.names.length > 1) return `Tie: ${multi.names.join(', ')}`;
+        if (multi.names.length === 1) return multi.names[0];
+      } catch {}
       const name = await this.contract.getWinner();
       if (typeof name === 'string' && name && name !== 'No candidates' && name !== 'No winner') {
         return name;
       }
-      // Fallback to client-side compute
+      // Fallback to client-side compute (also detect ties)
       const { names, votes } = await this.getResults();
       if (!names.length) return 'No candidates';
       let max = -1;
-      let idx = -1;
       for (let i = 0; i < votes.length; i++) {
-        if (votes[i] > max) { max = votes[i]; idx = i; }
+        if (votes[i] > max) { max = votes[i]; }
       }
-      if (idx < 0 || max <= 0) return 'No winner';
-      return names[idx];
+      if (max <= 0) return 'No winner';
+      const tied = names.filter((_, i) => votes[i] === max);
+      return tied.length > 1 ? `Tie: ${tied.join(', ')}` : tied[0];
     } catch (e: any) {
       // If on-chain call reverted because voting not ended, still try computing from results
       try {
         const { names, votes } = await this.getResults();
         if (!names.length) return 'No candidates';
         let max = -1;
-        let idx = -1;
         for (let i = 0; i < votes.length; i++) {
-          if (votes[i] > max) { max = votes[i]; idx = i; }
+          if (votes[i] > max) { max = votes[i]; }
         }
-        if (idx < 0 || max <= 0) return 'No winner';
-        return names[idx];
+        if (max <= 0) return 'No winner';
+        const tied = names.filter((_, i) => votes[i] === max);
+        return tied.length > 1 ? `Tie: ${tied.join(', ')}` : tied[0];
       } catch (inner) {
         console.error('getWinner fallback failed:', inner);
         return 'No candidates';
       }
+    }
+  }
+
+  async startRunoff(ids: number[], startTime: number, endTime: number): Promise<string> {
+    try {
+      if (!this.contract && (this.signer || this.provider)) await this.loadContract();
+      if (!this.contract || !this.signer) throw new Error('Contract not initialized or wallet not connected');
+      const c = this.contract.connect(this.signer) as VotingContract;
+
+      // preflight: timing-related reverts (round not ended) should NOT block sending tx because mining advances local chain time
+      try {
+        if ((c as any).startRunoff?.staticCall) {
+          await (c as any).startRunoff.staticCall(ids, startTime, endTime);
+        }
+      } catch (pre: any) {
+        const reason = (pre?.reason || pre?.shortMessage || pre?.message || 'Unknown revert').toLowerCase();
+        const timing = ['end', 'ended', 'round', 'not ended', 'after the current round ends'];
+        if (!timing.some(k => reason.includes(k))) {
+          throw new Error('Runoff would revert: ' + (pre?.reason || pre?.shortMessage || pre?.message || 'Unknown'));
+        }
+        // else continue to send tx
+      }
+
+      // gas
+      let gasLimit: bigint | undefined;
+      try { const est = await ((c as any).startRunoff?.estimateGas?.(ids, startTime, endTime)); if (est) gasLimit = (BigInt(est) * 12n) / 10n; } catch {}
+
+      const fd = await ((this.signer as any).provider?.getFeeData?.() ?? {});
+      const minPriority = 1_000_000_000n;
+      const overrides: any = {};
+      if (fd?.maxFeePerGas || fd?.maxPriorityFeePerGas) {
+        let maxPriority: bigint = (fd?.maxPriorityFeePerGas as any) ?? minPriority;
+        try { if (typeof maxPriority !== 'bigint') maxPriority = BigInt(maxPriority); } catch { maxPriority = minPriority; }
+        if (maxPriority < minPriority) maxPriority = minPriority;
+        let suggestedMax: bigint | undefined = fd?.maxFeePerGas as any;
+        try { if (suggestedMax && typeof suggestedMax !== 'bigint') suggestedMax = BigInt(suggestedMax); } catch { suggestedMax = undefined; }
+        const lastBase: bigint | undefined = (fd?.lastBaseFeePerGas as any) ?? undefined;
+        let maxFee: bigint = suggestedMax ?? (lastBase ? (lastBase * 2n + maxPriority) : (3_000_000_000n));
+        if (maxFee < (maxPriority + minPriority)) maxFee = maxPriority + minPriority;
+        overrides.maxFeePerGas = maxFee;
+        overrides.maxPriorityFeePerGas = maxPriority;
+      } else {
+        let gasPrice: bigint = (fd?.gasPrice as any) ?? 2_000_000_000n;
+        try { if (typeof gasPrice !== 'bigint') gasPrice = BigInt(gasPrice); } catch { gasPrice = 2_000_000_000n; }
+        overrides.type = 0;
+        overrides.gasPrice = gasPrice;
+      }
+      if (!gasLimit) gasLimit = 350_000n;
+      overrides.gasLimit = gasLimit;
+
+      const tx = await (c as any).startRunoff(ids, startTime, endTime, overrides);
+      const receipt = await tx.wait();
+      return receipt?.hash ?? (() => { throw new Error('Transaction failed'); })();
+    } catch (e: any) {
+      if (e?.code === 4001) throw new Error('Transaction rejected by user');
+      throw new Error('Failed to start runoff: ' + (e?.reason || e?.message || String(e)));
     }
   }
 
@@ -868,6 +1003,30 @@ class ContractService {
     } catch (e) {
       console.error('getVotingPeriod failed:', e);
       return { startTime: 0, endTime: 0, isActive: false };
+    }
+  }
+
+  async getCurrentElectionRound(): Promise<number> {
+    try {
+      if (!this.contract || !(this.contract as any).electionRound) return 0;
+      const round = await (this.contract as any).electionRound();
+      return Number(round);
+    } catch (e) {
+      console.error('getCurrentElectionRound failed:', e);
+      return 0;
+    }
+  }
+
+  async getLastVotedRound(address?: string): Promise<number> {
+    try {
+      if (!this.contract || !(this.contract as any).lastVotedRound) return 0;
+      const voter = address || this.account;
+      if (!voter) return 0;
+      const round = await (this.contract as any).lastVotedRound(voter);
+      return Number(round);
+    } catch (e) {
+      console.error('getLastVotedRound failed:', e);
+      return 0;
     }
   }
 

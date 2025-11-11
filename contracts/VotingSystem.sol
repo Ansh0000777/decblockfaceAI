@@ -17,6 +17,10 @@ contract VotingSystem {
     uint256 public votingEndTime;
     bool public votingPeriodSet;
 
+    // Runoff & rounds
+    uint256 public electionRound; // increments when a runoff starts
+    mapping(address => uint256) public lastVotedRound; // round in which an address last voted
+
     // Mappings
     mapping(uint256 => Candidate) public candidates;
     mapping(address => bool) public hasVotedMapping;
@@ -31,6 +35,7 @@ contract VotingSystem {
     event VotingPeriodSet(uint256 startTime, uint256 endTime);
     event CandidateRemoved(uint256 indexed candidateId);
     event VotingPeriodCleared();
+    event RunoffStarted(uint256[] ids, uint256 startTime, uint256 endTime, uint256 round);
 
     // Modifiers
     modifier onlyOwner() {
@@ -61,7 +66,7 @@ contract VotingSystem {
     }
 
     modifier hasNotVoted() {
-        require(!hasVotedMapping[msg.sender], "You have already voted");
+        require(lastVotedRound[msg.sender] != electionRound, "You have already voted");
         _;
     }
 
@@ -72,6 +77,7 @@ contract VotingSystem {
         votingStartTime = 0;
         votingEndTime = 0;
         votingPeriodSet = false;
+        electionRound = 0;
     }
 
     // Admin functions
@@ -111,7 +117,9 @@ contract VotingSystem {
     function setVotingPeriod(uint256 _startTime, uint256 _endTime) public onlyOwner {
         require(_startTime > block.timestamp, "Start time must be in the future");
         require(_endTime > _startTime, "End time must be after start time");
-        require(_endTime - _startTime >= 60, "Voting period must be at least 60 seconds");
+        uint256 duration = _endTime - _startTime;
+        require(duration >= 60, "Voting period must be at least 60 seconds");
+        require(duration <= 30 days, "Voting period must be 30 days or less");
 
         votingStartTime = _startTime;
         votingEndTime = _endTime;
@@ -120,10 +128,46 @@ contract VotingSystem {
     }
 
     function clearVotingPeriod() public onlyOwnerOrAdmin {
+        // Reset vote counts for all currently tracked candidates
+        for (uint256 i = 0; i < candidateIds.length; i++) {
+            uint256 cid = candidateIds[i];
+            if (candidateExists[cid]) {
+                candidates[cid].voteCount = 0;
+            }
+        }
         votingStartTime = 0;
         votingEndTime = 0;
         votingPeriodSet = false;
+        // Advance round so wallets become eligible to vote again in the next scheduled period
+        electionRound += 1;
         emit VotingPeriodCleared();
+    }
+
+    function startRunoff(uint256[] memory idsForRunoff, uint256 _startTime, uint256 _endTime) public onlyOwnerOrAdmin {
+        // Must not overlap with current active period; allow after end or when not set
+        require(!votingPeriodSet || block.timestamp > votingEndTime, "Runoff can start only after the current round ends");
+        require(idsForRunoff.length >= 2, "Need at least 2 candidates for runoff");
+        require(_endTime > _startTime && _endTime - _startTime >= 60, "Invalid runoff window");
+        // Reset candidate set to provided ids, keep their names, reset votes
+        // First, mark all as not exists
+        for (uint256 i = 0; i < candidateIds.length; i++) {
+            candidateExists[candidateIds[i]] = false;
+        }
+        // Build new candidateIds
+        delete candidateIds;
+        for (uint256 j = 0; j < idsForRunoff.length; j++) {
+            uint256 cid = idsForRunoff[j];
+            require(bytes(candidates[cid].name).length > 0, "Invalid candidate id");
+            candidateExists[cid] = true;
+            candidates[cid].voteCount = 0;
+            candidateIds.push(cid);
+        }
+        // Advance round so everyone can vote again
+        electionRound += 1;
+        votingStartTime = _startTime;
+        votingEndTime = _endTime;
+        votingPeriodSet = true;
+        emit RunoffStarted(idsForRunoff, _startTime, _endTime, electionRound);
     }
 
     // Voter functions
@@ -135,7 +179,8 @@ contract VotingSystem {
     {
         require(msg.sender != CANDIDATE_MANAGER, "Manager cannot vote");
         candidates[_candidateId].voteCount++;
-        hasVotedMapping[msg.sender] = true;
+        lastVotedRound[msg.sender] = electionRound;
+        hasVotedMapping[msg.sender] = true; // legacy flag
         emit VoteCast(msg.sender, _candidateId);
     }
 
@@ -167,29 +212,36 @@ contract VotingSystem {
         return (ids, names, votes);
     }
 
-    function getWinner() public view returns (string memory winnerName) {
+    function getWinners() public view returns (uint256[] memory ids, string[] memory names) {
         require(block.timestamp > votingEndTime || !votingPeriodSet, "Voting has not ended yet");
-
         if (candidateIds.length == 0) {
-            return "No candidates";
+            return (new uint256[](0), new string[](0));
         }
-
         uint256 maxVotes = 0;
-        uint256 winnerId = 0;
-
         for (uint256 i = 0; i < candidateIds.length; i++) {
-            uint256 candidateId = candidateIds[i];
-            if (candidates[candidateId].voteCount > maxVotes) {
-                maxVotes = candidates[candidateId].voteCount;
-                winnerId = candidateId;
+            uint256 cid = candidateIds[i];
+            uint256 v = candidates[cid].voteCount;
+            if (v > maxVotes) maxVotes = v;
+        }
+        if (maxVotes == 0) {
+            return (new uint256[](0), new string[](0));
+        }
+        // count ties
+        uint256 count = 0;
+        for (uint256 i2 = 0; i2 < candidateIds.length; i2++) {
+            if (candidates[candidateIds[i2]].voteCount == maxVotes) count++;
+        }
+        ids = new uint256[](count);
+        names = new string[](count);
+        uint256 idx = 0;
+        for (uint256 j = 0; j < candidateIds.length; j++) {
+            uint256 idj = candidateIds[j];
+            if (candidates[idj].voteCount == maxVotes) {
+                ids[idx] = idj;
+                names[idx] = candidates[idj].name;
+                idx++;
             }
         }
-
-        if (winnerId == 0) {
-            return "No winner";
-        }
-
-        return candidates[winnerId].name;
     }
 
     function hasVoted(address _voter) public view returns (bool) {

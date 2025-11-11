@@ -93,6 +93,7 @@ async function main() {
   const args = process.argv.slice(2);
   const setAdminIndex = args.indexOf('--set-admin');
   const adminAddress = setAdminIndex >= 0 ? (args[setAdminIndex + 1] || '') : '';
+  const noWrite = args.includes('--no-write');
 
   const { abi, bytecode } = await compileExact();
 
@@ -111,6 +112,31 @@ async function main() {
   const address = await contract.getAddress();
   console.log('Deployed VotingSystem at:', address);
 
+  // Write to public/contractInfo.json (unless --no-write)
+  if (!noWrite) {
+    try {
+      const frontPath = path.join(__dirname, '..', 'public', 'contractInfo.json');
+      fs.writeFileSync(frontPath, JSON.stringify({ address }, null, 2));
+      console.log('Wrote frontend address ->', frontPath);
+    } catch (e) {
+      console.warn('Could not write public/contractInfo.json:', e?.message || String(e));
+    }
+    // Update .env REACT_APP_CONTRACT_ADDRESS
+    try {
+      const envPath = path.join(__dirname, '..', '.env');
+      let envText = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+      if (envText.includes('REACT_APP_CONTRACT_ADDRESS=')) {
+        envText = envText.replace(/REACT_APP_CONTRACT_ADDRESS=.*/g, 'REACT_APP_CONTRACT_ADDRESS=' + address);
+      } else {
+        envText += (envText.endsWith('\n') ? '' : '\n') + 'REACT_APP_CONTRACT_ADDRESS=' + address + '\n';
+      }
+      fs.writeFileSync(envPath, envText);
+      console.log('Updated .env REACT_APP_CONTRACT_ADDRESS');
+    } catch (e) {
+      console.warn('Could not update .env:', e?.message || String(e));
+    }
+  }
+
   if (adminAddress) {
     if (!/^0x[a-fA-F0-9]{40}$/.test(adminAddress)) {
       console.error('Invalid admin address after --set-admin');
@@ -123,7 +149,12 @@ async function main() {
   }
 
   console.log('\nNext steps:');
-  console.log('  1) Update .env -> REACT_APP_CONTRACT_ADDRESS=' + address);
+  if (noWrite) {
+    console.log('  1) Update .env -> REACT_APP_CONTRACT_ADDRESS=' + address);
+    console.log('  2) Update public/contractInfo.json -> {"address":"' + address + '"}');
+  } else {
+    console.log('  1) Frontend address and .env updated automatically');
+  }
   console.log('  2) npm start (restart if running)');
 }
 

@@ -30,6 +30,10 @@ const AdminDashboard: React.FC = () => {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [winner, setWinner] = useState<string>('');
+  const [tieNames, setTieNames] = useState<string[]>([]);
+  const [tieIds, setTieIds] = useState<number[]>([]);
+  const [checkingTie, setCheckingTie] = useState(false);
+  const [chainNow, setChainNow] = useState<number>(0);
 
   const initializeDashboard = useCallback(async () => {
     try {
@@ -64,6 +68,20 @@ const AdminDashboard: React.FC = () => {
     initializeDashboard();
   }, [initializeDashboard]);
 
+  // Poll on-chain time so we know when the round has truly ended
+  useEffect(() => {
+    let id: any;
+    const tick = async () => {
+      try {
+        const ts = await ContractService.getCurrentBlockTimestamp();
+        setChainNow(ts);
+      } catch {}
+    };
+    tick();
+    id = setInterval(tick, 2000);
+    return () => clearInterval(id);
+  }, []);
+
   const loadData = async () => {
     try {
       const candidatesData = await ContractService.getCandidates();
@@ -74,7 +92,10 @@ const AdminDashboard: React.FC = () => {
       setCandidates(candidatesList);
 
       const votingPeriodData = await ContractService.getVotingPeriod();
-      setVotingPeriod(votingPeriodData);
+      // Derive active using system time to avoid stale contract flag
+      const nowSys = Math.floor(Date.now() / 1000);
+      const activeNow = votingPeriodData.startTime > 0 && nowSys >= votingPeriodData.startTime && nowSys < votingPeriodData.endTime;
+      setVotingPeriod({ ...votingPeriodData, isActive: activeNow });
 
       // Set datetime-local inputs from voting period
       if (votingPeriodData.startTime > 0) {
@@ -86,6 +107,46 @@ const AdminDashboard: React.FC = () => {
       if (votingPeriodData.endTime > 0 && Date.now() > votingPeriodData.endTime * 1000) {
         const winnerData = await ContractService.getWinner();
         setWinner(winnerData);
+        try {
+          const multi = await (ContractService as any).getWinners?.();
+          if (multi && multi.names && multi.names.length > 1) {
+            setTieNames(multi.names);
+            setTieIds(multi.ids);
+          } else {
+            // Fallback: compute tie from results
+            const res = await ContractService.getResults();
+            if (res.votes.length > 0) {
+              const max = Math.max(...res.votes);
+              const idxs = res.votes.map((v, i) => (v === max ? i : -1)).filter(i => i >= 0);
+              if (idxs.length > 1) {
+                setTieNames(idxs.map(i => res.names[i]));
+                setTieIds(idxs.map(i => res.ids[i]));
+              } else {
+                setTieNames([]);
+                setTieIds([]);
+              }
+            } else {
+              setTieNames([]);
+              setTieIds([]);
+            }
+          }
+        } catch {
+          // Final fallback to results
+          try {
+            const res = await ContractService.getResults();
+            if (res.votes.length > 0) {
+              const max = Math.max(...res.votes);
+              const idxs = res.votes.map((v, i) => (v === max ? i : -1)).filter(i => i >= 0);
+              if (idxs.length > 1) {
+                setTieNames(idxs.map(i => res.names[i]));
+                setTieIds(idxs.map(i => res.ids[i]));
+              } else {
+                setTieNames([]);
+                setTieIds([]);
+              }
+            }
+          } catch {}
+        }
       }
     } catch (error) {
       console.error('Failed to load data:', error);
@@ -200,6 +261,41 @@ const AdminDashboard: React.FC = () => {
     } catch (error) {
       console.error('Failed to load results:', error);
       setError('Failed to load voting results');
+    }
+  };
+
+  const startRunoff = async () => {
+    try {
+      setCheckingTie(true);
+      const nowTs = await ContractService.getCurrentBlockTimestamp();
+      // Even if on-chain time is slightly behind, sending the tx will mine a new block and advance time in Ganache.
+      // Derive duration from the previous voting period
+      let duration = 120; // fallback 2 minutes
+      if (votingPeriod.startTime && votingPeriod.endTime && votingPeriod.endTime > votingPeriod.startTime) {
+        duration = Math.max(60, Math.min(30 * 24 * 60 * 60, (votingPeriod.endTime - votingPeriod.startTime))); // 60s..30d
+      }
+      // Start no earlier than endTime+1 and add ~60s buffer
+      const start = Math.max(nowTs + 60, (votingPeriod.endTime || nowTs) + 1);
+      const end = start + duration;
+      if (!tieIds.length || tieIds.length < 2) {
+        // re-evaluate tie in case state is stale
+        const multi = await (ContractService as any).getWinners?.();
+        if (!multi || !multi.ids || multi.ids.length < 2) {
+          setError('No tie to run off.');
+          setCheckingTie(false);
+          return;
+        }
+        setTieIds(multi.ids);
+        setTieNames(multi.names || []);
+      }
+      await (ContractService as any).startRunoff?.(tieIds, start, end);
+      setMessage('Quick vote started successfully');
+      await loadData();
+      setTimeout(() => setMessage(''), 3000);
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start quick vote');
+    } finally {
+      setCheckingTie(false);
     }
   };
 
@@ -354,7 +450,7 @@ const AdminDashboard: React.FC = () => {
                 <button type="submit" style={styles.primaryButton}>
                   Set Voting Period
                 </button>
-                <button type="button" style={styles.secondaryButton} onClick={handleClearVotingPeriod}>
+                <button type="button" style={styles.primaryButton} onClick={handleClearVotingPeriod}>
                   Clear Voting Period
                 </button>
               </div>
@@ -383,13 +479,24 @@ const AdminDashboard: React.FC = () => {
           {/* Results */}
           <div style={styles.card}>
             <h2>Voting Results</h2>
-            <button onClick={loadResults} style={styles.secondaryButton}>
-              Load Results
-            </button>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              <button onClick={loadResults} style={styles.secondaryButton}>
+                Load Results
+              </button>
+              {/* Show when voting ended by system OR on-chain time and tie exists */}
+              {tieNames.length > 1 && (votingPeriod.endTime > 0 && (chainNow >= votingPeriod.endTime || Math.floor(Date.now() / 1000) >= votingPeriod.endTime)) && (
+                <button onClick={startRunoff} style={styles.primaryButton} disabled={checkingTie}>
+                  {checkingTie ? 'Starting Quick Vote...' : `Start Quick Vote (${tieNames.join(' vs ')})`}
+                </button>
+              )}
+            </div>
 
             {winner && winner !== 'No candidates' && (
               <div style={styles.winnerAnnouncement}>
                 <h3>🎉 Winner: {winner} 🎉</h3>
+                {tieNames.length > 1 && (
+                  <p style={{ marginTop: 8 }}>Tie detected between: {tieNames.join(', ')}</p>
+                )}
               </div>
             )}
 
